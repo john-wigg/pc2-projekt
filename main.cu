@@ -75,10 +75,16 @@ void __global__ step(double *u, int n, int g, double c, double* max_dev,
  */
 void __global__ master(double *u, int n, int g, double c, dim3 gridSize, dim3 blockSize, double *max_dev,
                        int number_snapshots, int* snapshot_steps, double* snapshots, bool *global_abort) {
+    /* Use a cooperative group to sync all threads. */
     cooperative_groups::grid_group grp = cooperative_groups::this_grid();
+    /* Get x and y indices in the grid. */
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int idy = blockIdx.y * blockDim.y + threadIdx.y;
+
+    /* Assign a singular id as well (makes checking for first thread easier). */
     int id = idx * gridSize.x + idy;
+
+    /* Keep track of snapshot index. */
     int cur_snapshot_index = 0;
 
     /* The convergence detection is done in two steps:
@@ -90,43 +96,51 @@ void __global__ master(double *u, int n, int g, double c, dim3 gridSize, dim3 bl
      * shared memory.
      */
     __shared__ int abort[1];
+
+    /* TODO: Maximum iterations currently hardcoded to 10000 */
     for(int k = 0; k < 10000; ++k) {
         if (id == 0) {
             /* Snapshotting. */
             bool take_snapshot = false;
-            if (cur_snapshot_index < number_snapshots) {
-                if (k * g  >= snapshot_steps[cur_snapshot_index]) {
+            if (cur_snapshot_index < number_snapshots) { // check whether there are still snapshots to do
+                if (k * g  >= snapshot_steps[cur_snapshot_index]) { // check whether we should to a snapshot
                     take_snapshot = true;
                     ++cur_snapshot_index;
                 }
             }
 
+            /* Execute a "step" kernel */
             step<<<gridSize, blockSize, blockSize.x*blockSize.y*sizeof(double)*2>>>(u, n, g, c, max_dev, snapshots, take_snapshot, cur_snapshot_index-1);
 
-            abort[0] = 1;
+            /* Initialize global abort flag. */
+            if (id == 0) *global_abort = 1;
         }
 
+        /* Initialize (block-local) abort flag */
+        if (threadIdx.x == 0 && threadIdx.y == 0) *abort = 1;
+
+        /* Wait for "step" execution. */
         __syncthreads();
         if (id == 0) cudaDeviceSynchronize();
-        __syncthreads();
-
         grp.sync();
 
         if (idx < gridSize.x && idy < gridSize.y)
         {
             if (max_dev[idx * gridSize.y + idy] > 0.01) { // epsilon
-                abort[0] = 0; // continue computation
+                *abort = 0; // continue computation
             }
         }
-        
-        grp.sync();
+
+        /* Wait till all threads in the block have checked. */
+        __syncthreads();
         /* Save write operations by only having the top left thread of the
          * block write to global memory. */
         if (threadIdx.x == 0 && threadIdx.y == 0) {
-            if (abort[0] == 1) *global_abort = 1;
+            if (*abort == 0) *global_abort = 0;
         }
-        grp.sync();
 
+        /* Wait till all blocks in the grid have checked. */
+        grp.sync();
         if (*global_abort == 1) break;
     }
 }
@@ -192,7 +206,7 @@ int main(int argc, char** argv) {
     cudaMemcpy(snapshot_steps_dev, snapshot_steps.data(), snapshot_steps.size()*sizeof(int), cudaMemcpyHostToDevice);
 
     /* Start the "master" kernel that is responible for the dynamic parallelism. */
-    master<<<dim3(1, 1), dim3(32, 32)>>>(u_dev, n, g, c, gridSize, blockSize, max_dev, snapshot_steps.size(), snapshot_steps_dev, snapshots_dev, global_abort);
+    master<<<dim3(2, 2), dim3(16, 16)>>>(u_dev, n, g, c, gridSize, blockSize, max_dev, snapshot_steps.size(), snapshot_steps_dev, snapshots_dev, global_abort);
 
     /* Copy from device to host. */
     cudaMemcpy(u_host, u_dev, n*n*sizeof(double), cudaMemcpyDeviceToHost);
