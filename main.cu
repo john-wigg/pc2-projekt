@@ -107,7 +107,7 @@ void __global__ director(float *u, int n, int g, float c, dim3 gridSize, dim3 bl
 
         if (*grid_converged == true) break;
     }
-    *iterations = k;
+    *iterations = k * g;
 }
 
 int main(int argc, char** argv) {
