@@ -7,34 +7,38 @@
 #define float float
 
 void __global__ computeBlocks(float *u, int n, int g, float c, bool* block_converged,
-                     float* snapshots, bool take_snapshot, int cur_snapshot_index) {
+                     float* snapshots, bool take_snapshot, int cur_snapshot_index, float conv_epsilon) {
     
+    /* Store new and old grid in shared memory. */
     extern __shared__ float shared_mem[];
     float *u_local = shared_mem;
     float *u_local_new = shared_mem + blockDim.x*blockDim.y;
 
+    /* Get the indices in the grid */
     int i = blockIdx.x * (blockDim.x - 2 * g) + threadIdx.x - g;
     int j = blockIdx.y * (blockDim.y - 2 * g) + threadIdx.y - g;
     
-    // Geisterzonen austauschen
+    /* Get the index/offset inside the current thread block */
     int local_index = threadIdx.x * blockDim.x + threadIdx.y;
     
-    
+    /* Write values from grid to shared memory. */
     if (i >= 0 && j >= 0 && i < n && j < n) {
         u_local_new[local_index] = u[i * n + j];
-    } else {
-        u_local_new[local_index] = 0.0;
     }
 
+    /* Initialize the convergence flag for the entire block. */
     if (threadIdx.x == 0 && threadIdx.y == 0) {
         block_converged[blockIdx.x * 32 + blockIdx.y] = true;
     }
     
+    /* Iterate until ghost zones exceeded. */
     for (int k = 0; k < g; ++k) {
+        /* Swap old with new grid. */
         u_local[local_index] = u_local_new[local_index];
         __syncthreads();
+        /* Update grid. */
         if (threadIdx.x > k && threadIdx.y > k && threadIdx.x < blockDim.x - 1 - k && threadIdx.y < blockDim.y - 1 - k) {
-            if (i > 0 && j > 0 && i < n - 1 && j < n - 1) {
+            if (i > 0 && j > 0 && i < n - 1 && j < n - 1) { // Exclude boundary
                 u_local_new[local_index] = u_local[local_index] + c * (u_local[local_index + 1] 
                                                                     + u_local[local_index - 1]
                                                                     + u_local[local_index - blockDim.x]
@@ -45,19 +49,17 @@ void __global__ computeBlocks(float *u, int n, int g, float c, bool* block_conve
         __syncthreads();
     }
 
-    // Zurückschreiben.
+    /* Write back to global memory. */
     if (threadIdx.x >= g && threadIdx.y >= g && threadIdx.x < (blockDim.x - g) && threadIdx.y < (blockDim.y - g)) {
         if (i > 0 && j > 0 && n - 1 && j < n - 1) {
             u[i * n + j] = u_local_new[local_index];
+            /* Set the block's convergence flag to false if one point has not converged. */
             if (fabs(u_local[local_index] - u_local_new[local_index]) > 0.0001) {
                 block_converged[blockIdx.x * 32 + blockIdx.y] = false;
             }
         }
     }
 
-    __syncthreads();
-
-    
     /* Snapshotting. */
     if (take_snapshot) {
         int offset = n*n*cur_snapshot_index;
@@ -74,7 +76,7 @@ void __global__ computeBlocks(float *u, int n, int g, float c, bool* block_conve
  * last iteration is below a certain epsilon.
  */
 void __global__ master(float *u, int n, int g, float c, dim3 gridSize, dim3 blockSize, bool *block_converged,
-                       int number_snapshots, int* snapshot_steps, float* snapshots, bool *grid_converged, int max_it, int *iterations) {
+                       int number_snapshots, int* snapshot_steps, float* snapshots, bool *grid_converged, int max_it, int *iterations, float conv_epsilon) {
     /* Use a cooperative group to sync all threads. */
     cooperative_groups::grid_group grp = cooperative_groups::this_grid();
     /* Get x and y indices in the grid. */
@@ -109,7 +111,7 @@ void __global__ master(float *u, int n, int g, float c, dim3 gridSize, dim3 bloc
             }
 
             /* Execute a "step" kernel */
-            computeBlocks<<<gridSize, blockSize, blockSize.x*blockSize.y*sizeof(float)*2>>>(u, n, g, c, block_converged, snapshots, take_snapshot, cur_snapshot_index-1);
+            computeBlocks<<<gridSize, blockSize, blockSize.x*blockSize.y*sizeof(float)*2>>>(u, n, g, c, block_converged, snapshots, take_snapshot, cur_snapshot_index-1, conv_epsilon);
 
             /* Initialize global abort flag. */
             if (id == 0) *grid_converged = true;
@@ -159,6 +161,9 @@ int main(int argc, char** argv) {
     /* Maximum iterations (will be rounded down to multiple of g). */
     int max_it = 100000;
 
+    /* Epsilon for convergence. */
+    float conv_epsilon = 0.0001;
+
     /* Simulation parameters. */
     float h = 0.1;
     float alpha = 1.0;
@@ -187,27 +192,28 @@ int main(int argc, char** argv) {
         return -1;
     }
 
+    std::cout << "Running on device: " << device_properties.name << "." << std::endl;
+
+    /* Device variables. */
     float *h_u; // Holds the grid values on the host.
     float *d_u; // Holds the grid values on the device.
     bool *d_block_converged; // Stores whether each therad block has converged.
     bool *d_grid_converged; // Stores whether the complete grid has converged.
     float *d_snapshots; // Holds the data of grid snaphots on the device.
-    float *h_snapshots; // Holds the data of grid snapshots on the host.
     int *d_snapshot_steps; // Holds the iteration steps at which to perform screenshots on the device. */
-    int *d_iterations; // Holds how many grid iterations were done inside the kernel.
-    int h_iterations;
+    int *d_iterations; // Holds how many grid iterations were done inside the kernel on the device.
+
+    /* Host variables. */
+    float *h_snapshots; // Holds the data of grid snapshots on the host.
+    int h_iterations; // Holds how many grid iterations were done inside the kernel on the host.
+
+    std::cout << "Host allocations..." << std::endl;
 
     /* Host allocations */
     h_u = (float *)malloc(n*n*sizeof(float));
     h_snapshots = (float *)malloc(n*n*snapshot_steps.size()*sizeof(float));
 
-    /* Device allocations. */
-    cudaMalloc((void **)&d_snapshot_steps, snapshot_steps.size()*sizeof(int));
-    cudaMalloc((void **)&d_snapshots, n*n*snapshot_steps.size()*sizeof(float));
-    cudaMalloc((void **)&d_u, n*n*sizeof(float));
-    cudaMalloc((void **)&d_block_converged, gridSize.x*gridSize.y*sizeof(bool));
-    cudaMalloc((void **)&d_grid_converged, sizeof(bool));
-    cudaMalloc((void **)&d_iterations, sizeof(int));
+    std::cout << "Initializing grid on host..." << std::endl;
 
     // Initialize the grid.
     for (int i = 0; i < n; ++i) {
@@ -221,10 +227,24 @@ int main(int argc, char** argv) {
         h_u[i * n + 0] = -25.0;
         h_u[i * n + n - 1] = 25.0;
     }
+
+    std::cout << "Device allocations..." << std::endl;
+
+    /* Device allocations. */
+    cudaMalloc((void **)&d_snapshot_steps, snapshot_steps.size()*sizeof(int));
+    cudaMalloc((void **)&d_snapshots, n*n*snapshot_steps.size()*sizeof(float));
+    cudaMalloc((void **)&d_u, n*n*sizeof(float));
+    cudaMalloc((void **)&d_block_converged, gridSize.x*gridSize.y*sizeof(bool));
+    cudaMalloc((void **)&d_grid_converged, sizeof(bool));
+    cudaMalloc((void **)&d_iterations, sizeof(int));
+
+    std::cout << "Copying from host to device..." << std::endl;
     
     /* Copy from host to device. */
     cudaMemcpy(d_u, h_u, n*n*sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_snapshot_steps, snapshot_steps.data(), snapshot_steps.size()*sizeof(int), cudaMemcpyHostToDevice);
+
+    std::cout << "Timing and starting master kernel... See you on the other side." << std::endl;
 
     float time;
     cudaEvent_t start, end;
@@ -232,19 +252,19 @@ int main(int argc, char** argv) {
     cudaEventCreate(&end);
     cudaEventRecord(start);
     /* Start the "master" kernel that is responible for the dynamic parallelism. */
-    master<<<dim3(2, 2), dim3(32, 32)>>>(d_u, n, g, c, gridSize, blockSize, d_block_converged, snapshot_steps.size(), d_snapshot_steps, d_snapshots, d_grid_converged, max_it, d_iterations);
+    master<<<dim3(2, 2), dim3(32, 32)>>>(d_u, n, g, c, gridSize, blockSize, d_block_converged, snapshot_steps.size(), d_snapshot_steps, d_snapshots, d_grid_converged, max_it, d_iterations, conv_epsilon);
     cudaEventRecord(end);
     cudaEventSynchronize(end);
     cudaEventElapsedTime(&time, start, end);
 
+    std::cout << "Copying data back to host..." << std::endl;
     
     /* Copy from device to host. */
     cudaMemcpy(h_u, d_u, n*n*sizeof(float), cudaMemcpyDeviceToHost);
     cudaMemcpy(h_snapshots, d_snapshots, n*n*snapshot_steps.size()*sizeof(float), cudaMemcpyDeviceToHost);
     cudaMemcpy(&h_iterations, d_iterations, sizeof(int), cudaMemcpyDeviceToHost);
 
-    std::cout << "Elapsed kernel time: " << time << std::endl;
-    std::cout << "Iterations: " << h_iterations << std::endl;
+    std::cout << "Writing snapshots and results to output files on host..." << std::endl;
     
     /* Write snapshoits. */
     for (int i = 0; i < snapshot_steps.size(); ++i) {
@@ -258,4 +278,7 @@ int main(int argc, char** argv) {
     printPPM(h_u, n, "out.ppm");
 
     std::cout << "Processing finished." << std::endl;
+    std::cout << "-----------------------------------------------" << std::endl;
+    std::cout << "Total elapsed KERNEL time: " << time << " ms" << std::endl;
+    std::cout << "Iterations until convergence: " << h_iterations << std::endl;
 }
