@@ -47,9 +47,11 @@ void __global__ computeBlocks(float *u, int n, int g, float c, bool* not_converg
 
     // Zurückschreiben.
     if (threadIdx.x >= g && threadIdx.y >= g && threadIdx.x < (blockDim.x - g) && threadIdx.y < (blockDim.y - g)) {
-        u[i * n + j] = u_local_new[local_index];
-        if (fabs(u_local[local_index] - u_local_new[local_index]) > 0.0001) {
-            not_converged[blockIdx.x * 32 + blockIdx.y] = true;
+        if (i > 0 && j > 0 && n - 1 && j < n - 1) {
+            u[i * n + j] = u_local_new[local_index];
+            if (fabs(u_local[local_index] - u_local_new[local_index]) > 0.0001) {
+                not_converged[blockIdx.x * 32 + blockIdx.y] = true;
+            }
         }
     }
 
@@ -194,10 +196,11 @@ int main(int argc, char** argv) {
             u_host[i * n + j] = 0.0;
         }
     }
-    for (int i = 200; i < 300; ++i) {
-        for (int j = 200; j < 300; ++j) {
-            u_host[i * n + j]= 25.0;
-        }
+    for (int i = 0; i < n; ++i) {
+        u_host[i] = -25.0;
+        u_host[(n - 1) * n + i] = 25.0;
+        u_host[i * n + 0] = -25.0;
+        u_host[i * n + n - 1] = 25.0;
     }
 
     printPPM(u_host, n, "init.ppm");
