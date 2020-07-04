@@ -1,7 +1,7 @@
 #include <fstream>
 #include <string>
 
-void printPPM(double *t, int size, std::string filename) {
+void printPPM(float *t, int size, std::string filename) {
     std::ofstream ofile(filename);
     ofile << "P3\n" << size << " " << size << "\n255\n";
 
@@ -10,7 +10,7 @@ void printPPM(double *t, int size, std::string filename) {
 
     for (int i = 0; i < size; ++i) {
         for (int j = 0; j < size; ++j) {
-            double val = t[i*size + j];
+            float val = t[i*size + j];
             int off = 3 * (i * size + j);
             if (val <= -25.0) {
                 rgb[2 + off] = 255;
