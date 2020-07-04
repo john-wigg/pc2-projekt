@@ -1,11 +1,10 @@
 #include <cuda.h>
 #include <iostream>
 #include <vector>
-#include <cooperative_groups.h>
 #include "io.cpp"
 #include <fstream>
 
-void __global__ computeBlocks(float *u, int n, int g, float c, bool* block_converged,
+void __global__ computeBlocks(float *u, int n, int g, float c, bool* grid_converged,
                      float* snapshots, bool take_snapshot, int cur_snapshot_index, float conv_epsilon) {
     
     /* Store new and old grid in shared memory. */
@@ -23,11 +22,6 @@ void __global__ computeBlocks(float *u, int n, int g, float c, bool* block_conve
     /* Write values from grid to shared memory. */
     if (i >= 0 && j >= 0 && i < n && j < n) {
         u_local_new[local_index] = u[i * n + j];
-    }
-
-    /* Initialize the convergence flag for the entire block. */
-    if (threadIdx.x == 0 && threadIdx.y == 0) {
-        block_converged[blockIdx.x * 32 + blockIdx.y] = true;
     }
     
     /* Iterate until ghost zones exceeded. */
@@ -54,7 +48,7 @@ void __global__ computeBlocks(float *u, int n, int g, float c, bool* block_conve
             u[i * n + j] = u_local_new[local_index];
             /* Set the block's convergence flag to false if one point has not converged. */
             if (fabs(u_local[local_index] - u_local_new[local_index]) > 0.0001) {
-                block_converged[blockIdx.x * 32 + blockIdx.y] = false;
+                *grid_converged = false;
             }
         }
     }
@@ -76,14 +70,6 @@ void __global__ computeBlocks(float *u, int n, int g, float c, bool* block_conve
  */
 void __global__ director(float *u, int n, int g, float c, dim3 gridSize, dim3 blockSize, bool *block_converged,
                        int number_snapshots, int* snapshot_steps, float* snapshots, bool *grid_converged, int max_it, int *iterations, float conv_epsilon) {
-    /* Use a cooperative group to sync all threads. */
-    cooperative_groups::grid_group grp = cooperative_groups::this_grid();
-    /* Get x and y indices in the grid. */
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int idy = blockIdx.y * blockDim.y + threadIdx.y;
-
-    /* Assign a singular id as well (makes checking for first thread easier). */
-    int id = idx * gridSize.x + idy;
 
     /* Keep track of snapshot index. */
     int cur_snapshot_index = 0;
@@ -96,52 +82,26 @@ void __global__ director(float *u, int n, int g, float c, dim3 gridSize, dim3 bl
      * This should be a performance improvement since most threads write to
      * shared memory.
      */
-    __shared__ bool local_converged; // block-local abort flag
+
     int k;
     for(k = 0; k < max_it / g; ++k) {
-        if (id == 0) {
-            /* Snapshotting. */
-            bool take_snapshot = false;
-            if (cur_snapshot_index < number_snapshots) { // check whether there are still snapshots to do
-                if (k * g  >= snapshot_steps[cur_snapshot_index]) { // check whether we should to a snapshot
-                    take_snapshot = true;
-                    ++cur_snapshot_index;
-                }
-            }
-
-            /* Execute a "step" kernel */
-            computeBlocks<<<gridSize, blockSize, blockSize.x*blockSize.y*sizeof(float)*2>>>(u, n, g, c, block_converged, snapshots, take_snapshot, cur_snapshot_index-1, conv_epsilon);
-
-            /* Initialize global abort flag. */
-            if (id == 0) *grid_converged = true;
-        }
-
-        /* Initialize (block-local) abort flag */
-        if (threadIdx.x == 0 && threadIdx.y == 0) local_converged = true;
-
-        /* Wait for "step" execution. */
-        __syncthreads();
-        if (id == 0) cudaDeviceSynchronize();
-        grp.sync();
-
-        if (idx < gridSize.x && idy < gridSize.y)
-        {
-            if (block_converged[idx * gridSize.y + idy] == false) { // epsilon
-                local_converged = false; // continue computation
+        /* Snapshotting. */
+        bool take_snapshot = false;
+        if (cur_snapshot_index < number_snapshots) { // check whether there are still snapshots to do
+            if (k * g  >= snapshot_steps[cur_snapshot_index]) { // check whether we should to a snapshot
+                take_snapshot = true;
+                ++cur_snapshot_index;
             }
         }
 
-        /* Wait till all threads in the block have checked. */
-        __syncthreads();
-        
-        /* Save write operations by only having the top left thread of the
-         * block write to global memory. */
-        if (threadIdx.x == 0 && threadIdx.y == 0) {
-            if (local_converged == false) *grid_converged = false;
-        }
+        /* Initialize global abort flag. */
+        *grid_converged = true;
 
-        /* Wait till all blocks in the grid have checked. */
-        grp.sync();
+        /* Execute a "step" kernel */
+        computeBlocks<<<gridSize, blockSize, blockSize.x*blockSize.y*sizeof(float)*2>>>(u, n, g, c, grid_converged, snapshots, take_snapshot, cur_snapshot_index-1, conv_epsilon);
+    
+        cudaDeviceSynchronize();
+
         if (*grid_converged == true) break;
     }
     *iterations = k;
@@ -182,9 +142,6 @@ int main(int argc, char** argv) {
 
     /* Thread block size. */
     dim3 gridSize = dim3(64, 64);
-
-    /* Thread block size in director kernel. */
-    dim3 blockSizeMaster = dim3(32, 32);
     
     //////////////////////////////////////////////////////////
     /*                 START OF PROGRAM                     */
@@ -214,10 +171,6 @@ int main(int argc, char** argv) {
     if (gridSize.x > device_properties.maxGridSize[0] || gridSize.y > device_properties.maxGridSize[1]) {
         std::cerr << "ERROR: Grid dimensions exceed maxGridSize. Choose a smaller grid." << std::endl;
         return -1;
-    }
-
-    if (blockSizeMaster.x * blockSizeMaster.y > device_properties.maxThreadsPerBlock) {
-        std::cerr << "ERROR: Director kernel exceeds maxThreadsPerBlock." << std::endl;
     }
 
     std::cout << "Running on device: " << device_properties.name << "." << std::endl;
@@ -280,7 +233,7 @@ int main(int argc, char** argv) {
     cudaEventCreate(&end);
     cudaEventRecord(start);
     /* Start the "director" kernel that is responible for the dynamic parallelism. */
-    director<<<dim3(gridSize.x / blockSizeMaster.x, gridSize.y / blockSizeMaster.y), blockSizeMaster>>>(d_u, n, g, c, gridSize, blockSize, d_block_converged, snapshot_steps.size(), d_snapshot_steps, d_snapshots, d_grid_converged, max_it, d_iterations, conv_epsilon);
+    director<<<1, 1>>>(d_u, n, g, c, gridSize, blockSize, d_block_converged, snapshot_steps.size(), d_snapshot_steps, d_snapshots, d_grid_converged, max_it, d_iterations, conv_epsilon);
     cudaEventRecord(end);
     cudaEventSynchronize(end);
     cudaEventElapsedTime(&time, start, end);
