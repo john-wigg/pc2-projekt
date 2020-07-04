@@ -55,8 +55,10 @@ void __global__ computeBlocks(float *u, int n, int g, float c, bool* grid_conver
 
     /* Snapshotting. */
     if (take_snapshot) {
-        int offset = n*n*cur_snapshot_index;
-        snapshots[offset + i * n + j] = u_local_new[local_index];
+        if (i >= 0 && j >= 0 && i < n && j < n) {
+            int offset = n*n*cur_snapshot_index;
+            snapshots[offset + i * n + j] = u_local_new[local_index];
+        }
     }
 }
 
@@ -68,7 +70,7 @@ void __global__ computeBlocks(float *u, int n, int g, float c, bool* grid_conver
  * The convergence criteria used here is that the maximum absolute change of all grid values since the
  * last iteration is below a certain epsilon.
  */
-void __global__ director(float *u, int n, int g, float c, dim3 gridSize, dim3 blockSize, bool *block_converged,
+void __global__ director(float *u, int n, int g, float c, dim3 gridSize, dim3 blockSize,
                        int number_snapshots, int* snapshot_steps, float* snapshots, bool *grid_converged, int max_it, int *iterations, float conv_epsilon) {
 
     /* Keep track of snapshot index. */
@@ -100,6 +102,7 @@ void __global__ director(float *u, int n, int g, float c, dim3 gridSize, dim3 bl
         /* Execute a "step" kernel */
         computeBlocks<<<gridSize, blockSize, blockSize.x*blockSize.y*sizeof(float)*2>>>(u, n, g, c, grid_converged, snapshots, take_snapshot, cur_snapshot_index-1, conv_epsilon);
     
+        /* Wait for kernel execution. */
         cudaDeviceSynchronize();
 
         if (*grid_converged == true) break;
@@ -178,7 +181,6 @@ int main(int argc, char** argv) {
     /* Device variables. */
     float *h_u; // Holds the grid values on the host.
     float *d_u; // Holds the grid values on the device.
-    bool *d_block_converged; // Stores whether each therad block has converged.
     bool *d_grid_converged; // Stores whether the complete grid has converged.
     float *d_snapshots; // Holds the data of grid snaphots on the device.
     int *d_snapshot_steps; // Holds the iteration steps at which to perform screenshots on the device. */
@@ -215,7 +217,6 @@ int main(int argc, char** argv) {
     cudaMalloc((void **)&d_snapshot_steps, snapshot_steps.size()*sizeof(int));
     cudaMalloc((void **)&d_snapshots, n*n*snapshot_steps.size()*sizeof(float));
     cudaMalloc((void **)&d_u, n*n*sizeof(float));
-    cudaMalloc((void **)&d_block_converged, gridSize.x*gridSize.y*sizeof(bool));
     cudaMalloc((void **)&d_grid_converged, sizeof(bool));
     cudaMalloc((void **)&d_iterations, sizeof(int));
 
@@ -233,7 +234,7 @@ int main(int argc, char** argv) {
     cudaEventCreate(&end);
     cudaEventRecord(start);
     /* Start the "director" kernel that is responible for the dynamic parallelism. */
-    director<<<1, 1>>>(d_u, n, g, c, gridSize, blockSize, d_block_converged, snapshot_steps.size(), d_snapshot_steps, d_snapshots, d_grid_converged, max_it, d_iterations, conv_epsilon);
+    director<<<1, 1>>>(d_u, n, g, c, gridSize, blockSize, snapshot_steps.size(), d_snapshot_steps, d_snapshots, d_grid_converged, max_it, d_iterations, conv_epsilon);
     cudaEventRecord(end);
     cudaEventSynchronize(end);
     cudaEventElapsedTime(&time, start, end);
