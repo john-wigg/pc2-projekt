@@ -3,8 +3,7 @@
 #include <vector>
 #include <cooperative_groups.h>
 #include "io.cpp"
-
-#define float float
+#include <fstream>
 
 void __global__ computeBlocks(float *u, int n, int g, float c, bool* block_converged,
                      float* snapshots, bool take_snapshot, int cur_snapshot_index, float conv_epsilon) {
@@ -67,7 +66,7 @@ void __global__ computeBlocks(float *u, int n, int g, float c, bool* block_conve
     }
 }
 
-/* This is the "master" kernel.
+/* This is the "director" kernel.
  * For each "major" iteration, its upper left thread starts a new "step" kernel. The kernel then waits for
  * for the "step" kernel to finish updating the grid and checks (in parallel), whether any thread blocks
  * of the "step" kernel have not converged yet. If at least one has not, the next "major" iteration is
@@ -75,7 +74,7 @@ void __global__ computeBlocks(float *u, int n, int g, float c, bool* block_conve
  * The convergence criteria used here is that the maximum absolute change of all grid values since the
  * last iteration is below a certain epsilon.
  */
-void __global__ master(float *u, int n, int g, float c, dim3 gridSize, dim3 blockSize, bool *block_converged,
+void __global__ director(float *u, int n, int g, float c, dim3 gridSize, dim3 blockSize, bool *block_converged,
                        int number_snapshots, int* snapshot_steps, float* snapshots, bool *grid_converged, int max_it, int *iterations, float conv_epsilon) {
     /* Use a cooperative group to sync all threads. */
     cooperative_groups::grid_group grp = cooperative_groups::this_grid();
@@ -149,8 +148,17 @@ void __global__ master(float *u, int n, int g, float c, dim3 gridSize, dim3 bloc
 }
 
 int main(int argc, char** argv) {
-    /* Cache configuration; we mainly want to use shared memory. */
-    cudaFuncSetCacheConfig(computeBlocks, cudaFuncCachePreferShared);
+    //////////////////////////////////////////////////////////
+    /*                    USER SETTINGS                     */
+    /* Can be edited by the user to modify the behaviour of */
+    /* the program.                                         */
+    /* Use nvcc main.cu -o main -rdc=true -arch=sm60 or the */
+    /* supplemented CMakeLists.txt to compile the program   */
+    /* after changing any of the settings.                  */
+    //////////////////////////////////////////////////////////
+    
+    /* Prefer shared cache in cache configuration. */
+    bool prefer_shared = true;
 
     /* Grid size in both directions. */
     int n = 1024;
@@ -168,15 +176,31 @@ int main(int argc, char** argv) {
     float h = 0.1;
     float alpha = 1.0;
     float dt = 0.1;
-    float c = alpha * dt / h*h;
 
     /* Snapshotting. */
     std::vector<int> snapshot_steps = {0, 100, 200, 300, 400}; // Steps at which to perform snapshots.
 
-    /* Thread block grid size. */
+    /* Thread block size. */
     dim3 gridSize = dim3(64, 64);
 
+    /* Thread block size in director kernel. */
+    dim3 blockSizeMaster = dim3(32, 32);
+    
+    //////////////////////////////////////////////////////////
+    /*                 START OF PROGRAM                     */
+    /*                Do not touch below!                   */
+    //////////////////////////////////////////////////////////
 
+    float c = alpha * dt / h*h;
+
+    /* Apply cache config. */
+    if (prefer_shared) {
+        cudaFuncSetCacheConfig(computeBlocks, cudaFuncCachePreferShared);
+    } else {
+        cudaFuncSetCacheConfig(computeBlocks, cudaFuncCachePreferL1);
+    }
+
+    /* Calculate block size. */
     dim3 blockSize = dim3(n / gridSize.x + 2*g, n / gridSize.y + 2*g);
 
     /* Catch configuration errors. */
@@ -190,6 +214,10 @@ int main(int argc, char** argv) {
     if (gridSize.x > device_properties.maxGridSize[0] || gridSize.y > device_properties.maxGridSize[1]) {
         std::cerr << "ERROR: Grid dimensions exceed maxGridSize. Choose a smaller grid." << std::endl;
         return -1;
+    }
+
+    if (blockSizeMaster.x * blockSizeMaster.y > device_properties.maxThreadsPerBlock) {
+        std::cerr << "ERROR: Director kernel exceeds maxThreadsPerBlock." << std::endl;
     }
 
     std::cout << "Running on device: " << device_properties.name << "." << std::endl;
@@ -244,15 +272,15 @@ int main(int argc, char** argv) {
     cudaMemcpy(d_u, h_u, n*n*sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_snapshot_steps, snapshot_steps.data(), snapshot_steps.size()*sizeof(int), cudaMemcpyHostToDevice);
 
-    std::cout << "Timing and starting master kernel... See you on the other side." << std::endl;
+    std::cout << "Timing and starting director kernel... See you on the other side." << std::endl;
 
     float time;
     cudaEvent_t start, end;
     cudaEventCreate(&start);
     cudaEventCreate(&end);
     cudaEventRecord(start);
-    /* Start the "master" kernel that is responible for the dynamic parallelism. */
-    master<<<dim3(2, 2), dim3(32, 32)>>>(d_u, n, g, c, gridSize, blockSize, d_block_converged, snapshot_steps.size(), d_snapshot_steps, d_snapshots, d_grid_converged, max_it, d_iterations, conv_epsilon);
+    /* Start the "director" kernel that is responible for the dynamic parallelism. */
+    director<<<dim3(gridSize.x / blockSizeMaster.x, gridSize.y / blockSizeMaster.y), blockSizeMaster>>>(d_u, n, g, c, gridSize, blockSize, d_block_converged, snapshot_steps.size(), d_snapshot_steps, d_snapshots, d_grid_converged, max_it, d_iterations, conv_epsilon);
     cudaEventRecord(end);
     cudaEventSynchronize(end);
     cudaEventElapsedTime(&time, start, end);
