@@ -248,7 +248,7 @@ int main(int argc, char** argv) {
 
     std::cout << "Writing snapshots and results to output files on host..." << std::endl;
     
-    /* Write snapshoits. */
+    /* Write snapshots. */
     for (int i = 0; i < snapshot_steps.size(); ++i) {
         int offset = n*n*i;
         char fname[32];
