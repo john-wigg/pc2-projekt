@@ -4,6 +4,46 @@
 #include "io.cpp"
 #include <fstream>
 
+//////////////////////////////////////////////////////////
+/*                    USER SETTINGS                     */
+/* Can be edited by the user to modify the behaviour of */
+/* the program.                                         */
+/* Use nvcc main.cu -o main -rdc=true -arch=sm60 or the */
+/* supplemented CMakeLists.txt to compile the program   */
+/* after changing any of the settings.                  */
+//////////////////////////////////////////////////////////
+
+/* Prefer shared cache in cache configuration. */
+bool prefer_shared = true;
+
+/* Grid size in both directions. */
+int n = 1024;
+
+/* Width of ghost zones. */
+int g = 3;
+
+/* Maximum iterations (will be rounded down to multiple of g). */
+int max_it = 1000000;
+
+/* Epsilon for convergence. */
+float conv_epsilon = 0.0000001;
+
+/* Simulation parameters. */
+float h = 0.1;
+float alpha = 1.0;
+float dt = 0.1;
+
+/* Snapshotting. */
+std::vector<int> snapshot_steps = {0, 25000, 50000, 75000}; // Steps at which to perform snapshots.
+
+/* Thread block size. */
+dim3 gridSize = dim3(64, 64);
+
+//////////////////////////////////////////////////////////
+/*                 START OF PROGRAM                     */
+/*                Do not touch below!                   */
+//////////////////////////////////////////////////////////
+
 void __global__ computeBlocks(float *u, int n, int g, float c, bool* grid_converged,
                      float* snapshots, bool take_snapshot, int cur_snapshot_index, float conv_epsilon) {
     
@@ -111,46 +151,6 @@ void __global__ director(float *u, int n, int g, float c, dim3 gridSize, dim3 bl
 }
 
 int main(int argc, char** argv) {
-    //////////////////////////////////////////////////////////
-    /*                    USER SETTINGS                     */
-    /* Can be edited by the user to modify the behaviour of */
-    /* the program.                                         */
-    /* Use nvcc main.cu -o main -rdc=true -arch=sm60 or the */
-    /* supplemented CMakeLists.txt to compile the program   */
-    /* after changing any of the settings.                  */
-    //////////////////////////////////////////////////////////
-    
-    /* Prefer shared cache in cache configuration. */
-    bool prefer_shared = true;
-
-    /* Grid size in both directions. */
-    int n = 1024;
-
-    /* Width of ghost zones. */
-    int g = 5;
-
-    /* Maximum iterations (will be rounded down to multiple of g). */
-    int max_it = 100000;
-
-    /* Epsilon for convergence. */
-    float conv_epsilon = 0.0001;
-
-    /* Simulation parameters. */
-    float h = 0.1;
-    float alpha = 1.0;
-    float dt = 0.1;
-
-    /* Snapshotting. */
-    std::vector<int> snapshot_steps = {0, 100, 200, 300, 400}; // Steps at which to perform snapshots.
-
-    /* Thread block size. */
-    dim3 gridSize = dim3(64, 64);
-    
-    //////////////////////////////////////////////////////////
-    /*                 START OF PROGRAM                     */
-    /*                Do not touch below!                   */
-    //////////////////////////////////////////////////////////
-
     float c = alpha * dt / h*h;
 
     /* Apply cache config. */
